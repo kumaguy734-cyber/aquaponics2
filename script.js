@@ -561,3 +561,90 @@ function setDefaults() {
 setDefaults();
 refresh();
 if (apiUrl) syncAll(); else setBanner('warn', 'クラウド連携先が未設定です。「データ取り込み・出力」タブで設定してください。');
+
+/* ---------- ESP32からBluetooth(BLE)で受信して保存 ---------- */
+const BLE_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const BLE_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const BLE_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const BLE_LAST_SEQ_KEY = 'ble_last_seq';
+
+async function receiveFromEsp32() {
+  if (!navigator.bluetooth) {
+    alert('このブラウザはBluetoothに対応していません。iPhoneではBluefyで開いてください。');
+    return;
+  }
+  if (!requireApi()) return;
+
+  const btn = $('btnBle');
+  const status = $('bleStatus');
+  btn.disabled = true;
+  status.textContent = 'ESP32を探しています...';
+
+  let device = null;
+  let timer = null;
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'AquaESP32' }],
+      optionalServices: [BLE_SERVICE]
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(BLE_SERVICE);
+    const tx = await service.getCharacteristic(BLE_TX);
+    const rx = await service.getCharacteristic(BLE_RX);
+
+    const lastSeq = parseInt(localStorage.getItem(BLE_LAST_SEQ_KEY) || '0', 10);
+    const lines = [];
+    const decoder = new TextDecoder();
+
+    const received = new Promise((resolve, reject) => {
+      tx.addEventListener('characteristicvaluechanged', e => {
+        const text = decoder.decode(e.target.value).trim();
+        if (text === 'END') resolve();
+        else if (text) lines.push(text);
+      });
+      device.addEventListener('gattserverdisconnected', () => reject(new Error('Bluetoothが切断されました')));
+      timer = setTimeout(() => reject(new Error('タイムアウトしました')), 60000);
+    });
+
+    await tx.startNotifications();
+    status.textContent = 'データを受信中...';
+    await rx.writeValue(new TextEncoder().encode('REQ:' + (lastSeq + 1)));
+    await received;
+
+    // 受信した行（seq,date,time,w,r,h,p）を、既存の環境データ形式に変換
+    let maxSeq = lastSeq;
+    const rows = [];
+    lines.forEach(line => {
+      const c = line.split(',');
+      if (c.length < 7) return;
+      const seq = parseInt(c[0], 10);
+      if (isNaN(seq)) return;
+      if (seq > maxSeq) maxSeq = seq;
+      rows.push({
+        k: `${c[1]} ${c[2]}|sd`,   // CSV取り込みと同じ形式（重複防止）
+        d: c[1], t: c[2],
+        w: numOrNull(c[3]), r: numOrNull(c[4]), h: numOrNull(c[5]), p: numOrNull(c[6]),
+        s: 'sd'
+      });
+    });
+
+    if (rows.length) {
+      status.textContent = `${rows.length}件をクラウドへ送信中...`;
+      const res = await apiPost('addEnvBulk', { rows });
+      status.textContent = `${res.added}件を保存しました（重複${res.skipped}件）。`;
+    } else {
+      status.textContent = '新しいデータはありませんでした。';
+    }
+    localStorage.setItem(BLE_LAST_SEQ_KEY, String(maxSeq));
+    await syncAll({ silent: true });
+  } catch (err) {
+    console.error(err);
+    status.textContent = '受信に失敗しました：' + err.message;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    btn.disabled = false;
+  }
+}
+
+$('btnBle').addEventListener('click', receiveFromEsp32);
